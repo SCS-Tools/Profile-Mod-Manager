@@ -1,0 +1,15 @@
+{
+  "uid": "5f2e68c1b4d74370a9e15c2f8d64b9a35f2e68c1b4d74370a9e15c2f8d64b9a3",
+  "name": "Profile Mod Manager",
+  "desc_ru": "Визуальный менеджер модификаций профиля ETS2: порядок загрузки, фильтры, группы, пресеты, резервные копии и HTML-экспорт.",
+  "desc_en": "A visual ETS2 profile mod manager with load-order editing, filters, groups, presets, backups and HTML export.",
+  "version": "1.0.0",
+  "icon": "icon.png",
+  "banner": "banner.png",
+  "runtime": {
+    "type": "html_python",
+    "entry": "app.html",
+    "logic": "logic.py",
+    "timeout": 900
+  }
+}
