@@ -619,11 +619,39 @@ import hashlib
 import base64
 import html as html_lib
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import mmap
 import struct
 import threading
 from urllib.parse import unquote, urlparse
+
+# ETS2 profile strings normally use UTF-8 ``\xNN`` bytes, but some older
+# Central-European profile data stores a single Windows-1250 byte instead
+# (for example ``\x8c`` for Č).  Decode a consecutive escape sequence as
+# UTF-8 first, then use the legacy code page only when UTF-8 is impossible.
+# A few profiles also escape the leading backslash one extra time.
+def unescape_sii_string(value):
+    source = str(value or "")
+    while "\\\\x" in source:
+        source = source.replace("\\\\x", "\\x")
+    result, index = [], 0
+    simple = {"n": "\n", "r": "\r", "t": "\t", "\\": "\\", '"': '"'}
+    while index < len(source):
+        if source[index:index + 2] == "\\x" and index + 3 < len(source) and re.fullmatch(r"[0-9a-fA-F]{2}", source[index + 2:index + 4]):
+            data = bytearray()
+            while source[index:index + 2] == "\\x" and index + 3 < len(source) and re.fullmatch(r"[0-9a-fA-F]{2}", source[index + 2:index + 4]):
+                data.append(int(source[index + 2:index + 4], 16)); index += 4
+            for encoding in ("utf-8", "cp1250", "cp1252", "cp1251", "latin-1"):
+                try:
+                    result.append(bytes(data).decode(encoding)); break
+                except UnicodeDecodeError:
+                    continue
+            continue
+        if source[index] == "\\" and index + 1 < len(source) and source[index + 1] in simple:
+            result.append(simple[source[index + 1]]); index += 2; continue
+        result.append(source[index]); index += 1
+    return "".join(result)
 
 # Profile Mod Manager owns the profile's load order.  Saving uses the shared
 # safe writer from Combo Installer, which creates a backup before replacement.
@@ -914,7 +942,7 @@ def mod_metadata_cache(folder, names, retry_icons=False, verify_cache=False):
         # archive.  Do not preserve that failure forever: retry it on the next
         # metadata request, while still reusing every real manifest instantly.
         if isinstance(record, dict) and record.get("fingerprint") == fingerprint and isinstance(metadata, dict) and metadata and not retry_needed and not icon_file_missing and not verify_cache:
-            result[name.casefold()] = record["metadata"]; next_cache[key] = record
+            result[mod_match_key(name)] = record["metadata"]; next_cache[key] = record
         else:
             pending.append((name, path, key, fingerprint))
     # Archive reads are I/O-bound. A bounded worker pool is substantially faster
@@ -925,7 +953,7 @@ def mod_metadata_cache(folder, names, retry_icons=False, verify_cache=False):
             name, key, fingerprint = futures[future]
             try: metadata = future.result()
             except Exception: metadata = {}
-            result[name.casefold()] = metadata
+            result[mod_match_key(name)] = metadata
             replacement = {"fingerprint": fingerprint, "metadata": metadata}
             if next_cache.get(key) != replacement:
                 next_cache[key] = replacement; cache_changed = True
@@ -952,7 +980,7 @@ def cached_mod_metadata(folder, names):
         # Empty cached metadata is deliberately omitted so the front end adds
         # that archive to its background parsing queue again.
         if isinstance(metadata, dict) and metadata and record.get("fingerprint") == fingerprint and not icon_file_missing:
-            result[name.casefold()] = metadata
+            result[mod_match_key(name)] = metadata
     return result
 
 def mod_folder_names(root):
@@ -964,6 +992,16 @@ def mod_folder_names(root):
     except OSError: return []
 
 ARCHIVE_SUFFIXES = {".scs", ".zip", ".7z", ".rar"}
+
+def mod_match_key(value):
+    """Case-insensitive, Unicode-normalized key for profile/package names.
+
+    ETS2 may write a decomposed character sequence in profile.sii while NTFS
+    reports the equivalent file name in NFC form (for example Č vs C + ̌).
+    Normalizing both sides prevents valid Czech, Polish and German names from
+    being incorrectly reported as missing.
+    """
+    return unicodedata.normalize("NFC", str(value or "")).casefold()
 
 def mod_file_aliases(value):
     """Return a name and all archive-suffix-free forms of it.
@@ -980,14 +1018,33 @@ def mod_file_aliases(value):
         aliases.append(next_name); current = next_name
     return aliases
 
+def legacy_escaped_name_matches(sii_value, candidate):
+    """Match an SII name containing a legacy one-byte ``\\xNN`` character.
+
+    Such bytes occur in a few ETS2 profiles but do not have one universal
+    code page.  They represent precisely one filename character, so after
+    normal UTF-8 matching fails we compare them as a one-character wildcard
+    against the physical package name.  This is deliberately an exact-length
+    full-name comparison, never a broad substring search.
+    """
+    raw = str(sii_value or "").rsplit("/", 1)[-1]
+    while "\\\\x" in raw:
+        raw = raw.replace("\\\\x", "\\x")
+    pattern, index = [], 0
+    while index < len(raw):
+        if raw[index:index + 2] == "\\x" and index + 3 < len(raw) and re.fullmatch(r"[0-9a-fA-F]{2}", raw[index + 2:index + 4]):
+            pattern.append("."); index += 4; continue
+        pattern.append(re.escape(raw[index])); index += 1
+    return bool(re.fullmatch("".join(pattern), unicodedata.normalize("NFC", str(candidate or "")), re.IGNORECASE))
+
 def mod_folder_index(root):
     """Index mod files once; large mod folders must not be scanned per mod."""
     names = mod_folder_names(root)
-    exact = {name.casefold(): name for name in names}
+    exact = {mod_match_key(name): name for name in names}
     stems = {}
     for name in names:
         for alias in mod_file_aliases(name)[1:]:
-            stems.setdefault(alias.casefold(), []).append(name)
+            stems.setdefault(mod_match_key(alias), []).append(name)
     return names, exact, stems
 
 def mod_file_details(folder, names):
@@ -996,9 +1053,9 @@ def mod_file_details(folder, names):
     for name in names:
         try:
             stat = (folder / name).stat()
-            result[name.casefold()] = {"created": stat.st_ctime, "size": stat.st_size}
+            result[mod_match_key(name)] = {"created": stat.st_ctime, "size": stat.st_size}
         except OSError:
-            result[name.casefold()] = {"created": 0, "size": 0}
+            result[mod_match_key(name)] = {"created": 0, "size": 0}
     return result
 
 def resolved_mod_file(sii_file, index):
@@ -1007,36 +1064,73 @@ def resolved_mod_file(sii_file, index):
     safe = Path(original.replace("\\", "/")).name
     if not safe: return original
     _names, exact, stems = index
-    if safe.casefold() in exact: return exact[safe.casefold()]
+    safe = unicodedata.normalize("NFC", safe)
+    if mod_match_key(safe) in exact: return exact[mod_match_key(safe)]
     # A dot is valid in a version number (for example "My Mod 1.2").  Match
     # every progressively archive-suffix-free form, including .scs.zip.
     for alias in mod_file_aliases(safe):
-        matches = stems.get(alias.casefold(), [])
+        matches = stems.get(mod_match_key(alias), [])
         if matches:
             # .scs is the standard local-mod archive and wins when several
             # forms of the same mod exist in the folder.
             return next((name for name in matches if Path(name).suffix.casefold() == ".scs"), matches[0])
+    # The profile's legacy byte can be an otherwise unmappable Central-
+    # European letter.  Preserve the real filename from mod/ when its rest is
+    # an exact match and the escaped byte occupies one character.
+    for name in _names:
+        if any(legacy_escaped_name_matches(sii_file, alias) for alias in mod_file_aliases(name)):
+            return name
     return safe
+
+def recovered_mod_file(sii_file, index):
+    """Recover a truncated leading UTF-8 escape from an old profile entry.
+
+    A damaged identifier such as ``x9fwilfersdorf_addon_promods`` has lost
+    its prefix and the backslash before the final escaped byte.  Match only a
+    sufficiently long surviving suffix, and accept it only if exactly one
+    archive in mod/ has that suffix.  Ambiguous results remain missing.
+    """
+    raw = str(sii_file or "").replace("\\", "/").rsplit("/", 1)[-1]
+    artifact = re.fullmatch(r"x[0-9a-fA-F]{2}(.{8,})", raw)
+    if not artifact:
+        return None
+    suffix = mod_match_key(artifact.group(1))
+    matches = [name for name in index[0]
+               if any(mod_match_key(alias).endswith(suffix) for alias in mod_file_aliases(name))]
+    return matches[0] if len(matches) == 1 else None
 
 def manager_mod_entries(root, text, metadata):
     values = {}
     for match in re.finditer(r'^\s*active_mods\[(\d+)\]\s*:\s*"(.*)"\s*$', text, re.MULTILINE):
         values[int(match.group(1))] = match.group(2)
     entries = []; folder_index = mod_folder_index(root)
+    _folder_names, folder_exact, _folder_stems = folder_index
     for index in sorted(values, reverse=True):
         value = values[index]
         file_value, name_value = (value.split("|", 1) + [value])[:2] if "|" in value else (value, value)
-        info = metadata.get(file_value.casefold()) or metadata.get(resolved_mod_file(file_value, folder_index).casefold(), {})
+        resolved_file = resolved_mod_file(file_value, folder_index)
+        # Some existing profiles already contain a damaged package identifier
+        # such as "x8cesko ...".  Its game title after the separator can still
+        # be the exact stem of the archive on disk.  Use that title only when
+        # the primary package lookup failed; do not guess from substrings.
+        if mod_match_key(resolved_file) not in folder_exact:
+            title_file = resolved_mod_file(name_value, folder_index)
+            if mod_match_key(title_file) in folder_exact:
+                resolved_file = title_file
+            else:
+                resolved_file = recovered_mod_file(file_value, folder_index) or resolved_file
+        canonical_value = resolved_file + "|" + name_value if mod_match_key(resolved_file) in folder_exact else value
+        info = metadata.get(mod_match_key(file_value)) or metadata.get(mod_match_key(resolved_file), {})
         entries.append({
             "index": index,
-            "file": resolved_mod_file(file_value, folder_index),
+            "file": resolved_file,
             "name": unescape_sii_string(name_value),
             "name": info.get("name") or unescape_sii_string(name_value),
             "version": info.get("version", ""), "author": info.get("author", ""),
             "convoy": info.get("convoy"), "dlc": info.get("dlc", []),
             "compatible_versions": info.get("compatible_versions", []),
             "categories": info.get("categories", []), "icon": info.get("icon", ""),
-            "sii_value": value,
+            "sii_value": canonical_value,
         })
     return entries
 
@@ -1066,39 +1160,39 @@ def manager_mods(game_path, directory):
     # profile.sii is the authoritative source for the in-game title of an
     # active mod.  Reuse it in the general mod library immediately, before
     # background manifest loading begins.
-    profile_names = {entry["file"].casefold(): entry["name"] for entry in entries if entry.get("name")}
+    profile_names = {mod_match_key(entry["file"]): entry["name"] for entry in entries if entry.get("name")}
     details = mod_file_details(folder, folder_names)
     for entry in entries:
         entry.update(details.get(entry["file"].casefold(), {"created": 0, "size": 0}))
     folder_mods = [{
         "file": name,
-        "name": metadata.get(name.casefold(), {}).get("name") or profile_names.get(name.casefold(), "") or Path(name).stem,
-        "version": metadata.get(name.casefold(), {}).get("version", ""),
-        "author": metadata.get(name.casefold(), {}).get("author", ""),
-        "convoy": metadata.get(name.casefold(), {}).get("convoy"),
-        "dlc": metadata.get(name.casefold(), {}).get("dlc", []),
-        "compatible_versions": metadata.get(name.casefold(), {}).get("compatible_versions", []),
-        "categories": metadata.get(name.casefold(), {}).get("categories", []),
-        "icon": metadata.get(name.casefold(), {}).get("icon", ""),
-        "description": metadata.get(name.casefold(), {}).get("description", ""),
-        "metadata_loaded": name.casefold() in metadata,
-        "manifest_found": bool(metadata.get(name.casefold(), {})),
-        **details.get(name.casefold(), {"created": 0, "size": 0}),
+        "name": metadata.get(mod_match_key(name), {}).get("name") or profile_names.get(mod_match_key(name), "") or Path(name).stem,
+        "version": metadata.get(mod_match_key(name), {}).get("version", ""),
+        "author": metadata.get(mod_match_key(name), {}).get("author", ""),
+        "convoy": metadata.get(mod_match_key(name), {}).get("convoy"),
+        "dlc": metadata.get(mod_match_key(name), {}).get("dlc", []),
+        "compatible_versions": metadata.get(mod_match_key(name), {}).get("compatible_versions", []),
+        "categories": metadata.get(mod_match_key(name), {}).get("categories", []),
+        "icon": metadata.get(mod_match_key(name), {}).get("icon", ""),
+        "description": metadata.get(mod_match_key(name), {}).get("description", ""),
+        "metadata_loaded": mod_match_key(name) in metadata,
+        "manifest_found": bool(metadata.get(mod_match_key(name), {})),
+        **details.get(mod_match_key(name), {"created": 0, "size": 0}),
     } for name in folder_names]
     return {"active_mods": int(count.group(1)) if count else 0, "mods": entries, "folder_mods": folder_mods, **game_log_info(root)}, None
 
 def load_mod_metadata(game_path, requested_names, retry_icons=False, verify_cache=False):
     root = Path(game_path).expanduser(); folder = root / "mod"
     if not folder.is_dir(): return [], None
-    available = {item.name.casefold(): item.name for item in folder.iterdir()
+    available = {mod_match_key(item.name): item.name for item in folder.iterdir()
                  if item.is_dir() or (item.is_file() and item.suffix.casefold() in (".scs", ".zip"))}
     names = []
     for value in requested_names if isinstance(requested_names, list) else []:
         if not isinstance(value, str): continue
-        name = available.get(Path(value).name.casefold())
+        name = available.get(mod_match_key(Path(value).name))
         if name: names.append(name)
     metadata = mod_metadata_cache(folder, names, bool(retry_icons), bool(verify_cache))
-    return [{"file": name, "metadata_loaded": True, "manifest_found": bool(metadata.get(name.casefold(), {})), **metadata.get(name.casefold(), {})} for name in names], None
+    return [{"file": name, "metadata_loaded": True, "manifest_found": bool(metadata.get(mod_match_key(name), {})), **metadata.get(mod_match_key(name), {})} for name in names], None
 
 def sii_escape_string(value):
     """Encode text safely for a quoted plain-SII value.
@@ -1122,12 +1216,14 @@ def profile_mod_value(value):
     """Return the game-facing active_mods value for one visible mod card."""
     raw = str(value)
     raw_file, raw_name = (raw.split("|", 1) + [raw])[:2] if "|" in raw else (raw, raw)
-    file_name = unescape_sii_string(raw_file).replace("\\", "/").rsplit("/", 1)[-1]
-    # The profile stores package names, not archive filenames.  Strip every
-    # known archive suffix so both ``foo.scs`` and ``foo.scs.zip`` become foo.
-    while Path(file_name).suffix.casefold() in ARCHIVE_SUFFIXES:
-        file_name = Path(file_name).stem
+    archive_name = unescape_sii_string(raw_file).replace("\\", "/").rsplit("/", 1)[-1]
+    # The manifest's in-game display name is preserved after the separator.
     display_name = unescape_sii_string(raw_name)
+    # ETS2 strips exactly one outer archive suffix.  Thus ``name.scs.zip``
+    # becomes ``name.scs``, whereas ``name.scs`` becomes ``name``.
+    file_name = archive_name
+    if Path(file_name).suffix.casefold() in ARCHIVE_SUFFIXES:
+        file_name = Path(file_name).stem
     return sii_escape_string(file_name) + "|" + sii_escape_string(display_name)
 
 def save_manager_mod_order(game_path, directory, values):
@@ -1316,17 +1412,32 @@ def mod_order_actions(before, after):
     after_positions = {item: index for index, item in enumerate(after)}
     label = lambda item: (item.split("|", 1)[1].strip() if "|" in item and item.split("|", 1)[1].strip() else item.split("|", 1)[0])
     actions = {}
-    for index, item in enumerate(after):
-        name = label(item)
-        if item not in before_positions:
-            actions[name] = {"Added": True, "position": index + 1}
-        elif before_positions[item] != index:
-            # Positive values mean the mod moved closer to the top.
-            delta = before_positions[item] - index
-            actions[name] = {"position": delta}
+    added = [item for item in after if item not in before_positions]
+    deleted = [item for item in before if item not in after_positions]
+    for item in added:
+        actions[label(item)] = {"Added": True, "position": after_positions[item] + 1}
     for item in before:
-        if item not in after_positions:
-            actions[label(item)] = {"Deleted": True}
+        if item in deleted: actions[label(item)] = {"Deleted": True}
+    # Inserting or deleting a mod naturally shifts every following row.  Those
+    # are not edits made by the user, so do not pollute the journal with them.
+    if added or deleted: return actions
+    # For a pure reorder, retain a longest sequence whose relative order did
+    # not change.  Only items outside it are reported as moved.
+    common = [item for item in before if item in after_positions]
+    sequence = [after_positions[item] for item in common]
+    lengths = [1] * len(sequence); previous = [-1] * len(sequence)
+    for right in range(len(sequence)):
+        for left in range(right):
+            if sequence[left] < sequence[right] and lengths[left] + 1 > lengths[right]:
+                lengths[right] = lengths[left] + 1; previous[right] = left
+    fixed = set()
+    if lengths:
+        cursor = max(range(len(lengths)), key=lengths.__getitem__)
+        while cursor >= 0:
+            fixed.add(common[cursor]); cursor = previous[cursor]
+    for item in common:
+        if item not in fixed:
+            actions[label(item)] = {"position": before_positions[item] - after_positions[item]}
     return actions
 
 def merge_mod_actions(first, second):
@@ -1359,9 +1470,9 @@ def autosave_order(directory, mods, description, actions=None):
         if actions:
             items = entry.setdefault("items", [])
             if items and items[-1].get("action") == "Unsaved changes" and time.time() - float(items[-1].get("updated_unix", 0)) < 3:
-                items[-1].update({"after": current, "actions": merge_mod_actions(items[-1].get("actions"), actions), "updated_unix": time.time()})
+                items[-1].update({"actions": merge_mod_actions(items[-1].get("actions"), actions), "updated_unix": time.time()})
             else:
-                items.append({"created": created, "updated_unix": time.time(), "action": "Unsaved changes", "before": previous, "after": current, "actions": actions})
+                items.append({"created": created, "updated_unix": time.time(), "action": "Unsaved changes", "actions": actions})
             entry["items"] = entry["items"][-100:]
         entry["autosave_last"] = current; save_resource_json("order_history.json", data)
         return {"autosaves": list_order_autosaves(directory), "history": entry.get("items", [])}, None
@@ -1377,12 +1488,23 @@ def clear_order_autosaves(directory):
 
 def order_history_data():
     value = load_resource_json("order_history.json", {})
-    return value if isinstance(value, dict) else {}
+    if not isinstance(value, dict): return {}
+    # Compact old journal entries on read as well.  Earlier releases stored
+    # full before/after orders and consequently listed every automatically
+    # shifted mod.  Recalculate the human-facing action list once, then drop
+    # the redundant snapshots from the history entry.
+    for profile in value.get("profiles", {}).values() if isinstance(value.get("profiles"), dict) else []:
+        if not isinstance(profile, dict): continue
+        for item in profile.get("items", []) if isinstance(profile.get("items"), list) else []:
+            if not isinstance(item, dict): continue
+            before, after = item.pop("before", None), item.pop("after", None)
+            if isinstance(before, list) and isinstance(after, list): item["actions"] = mod_order_actions(before, after)
+    return value
 
 def record_order_history(directory, action, before, after, actions=None):
     data = order_history_data(); profiles_data = data.setdefault("profiles", {}); entry = profiles_data.setdefault(str(directory), {"last": [], "items": []})
     if before != after:
-        entry.setdefault("items", []).append({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "action": action, "before": before, "after": after, "actions": actions if isinstance(actions, dict) else mod_order_actions(before, after)})
+        entry.setdefault("items", []).append({"created": time.strftime("%Y-%m-%d %H:%M:%S"), "action": action, "actions": actions if isinstance(actions, dict) else mod_order_actions(before, after)})
         entry["items"] = entry["items"][-100:]
     entry["last"] = after
     entry["autosave_last"] = after
