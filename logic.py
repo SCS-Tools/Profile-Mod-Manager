@@ -407,7 +407,7 @@ def backup_entries():
                 continue
             match = re.match(r"^(.+)-profile\.sii-\d{8}-\d{6}\.bak$", path.name)
             if not match: continue
-            directory = match.group(1).removesuffix("-order")
+            directory = match.group(1)[:-len("-order")] if match.group(1).endswith("-order") else match.group(1)
             text = profile_text(path); mods_list = active_mod_entries(text)
             entries.append({"id": path.name, "name": path.name, "kind": "profile", "profile_dir": directory, "created": created, "mods": mods_list, "mod_count": len(mods_list)})
         except (OSError, ValueError, zlib.error):
@@ -423,7 +423,8 @@ def restore_backup(game_path, backup_id):
     else:
         match = re.match(r"^(.+)-profile\.sii-\d{8}-\d{6}\.bak$", backup_id)
         if not match: return None, "backup_not_found"
-        target = Path(game_path).expanduser() / "profiles" / match.group(1).removesuffix("-order") / "profile.sii"
+        name = match.group(1); directory = name[:-len("-order")] if name.endswith("-order") else name
+        target = Path(game_path).expanduser() / "profiles" / directory / "profile.sii"
     if not target.is_file(): return None, "restore_target_not_found"
     try:
         safety = storage_root() / f"restore-before-{target.name}-{datetime.now():%Y%m%d-%H%M%S}.bak"
@@ -673,6 +674,9 @@ class CentralDirectoryZip:
         self.entries = {}
         self._read_directory()
 
+    def close(self):
+        self.data.close(); self._file.close()
+
     def _read_directory(self):
         data = self.data
         start = max(0, len(data) - (22 + 0xffff))
@@ -708,8 +712,11 @@ class CentralDirectoryZip:
             local_offset = self._u32(offset + 42)
             name_start = offset + 46
             name_raw = data[name_start:name_start + name_length]
-            encoding = "utf-8" if flags & 0x800 else "cp437"
-            name = name_raw.decode(encoding, errors="replace").replace("\\", "/").lstrip("/")
+            # SCS tools use UTF-8 names even when a protector erased the ZIP
+            # UTF-8 flag.  This is also what the updated Universal SCS
+            # Extractor does, and prevents a non-ASCII manifest/icon path
+            # from becoming an unmatchable CP437 string.
+            name = name_raw.decode("utf-8", errors="replace").replace("\\", "/").lstrip("/")
             extra = data[name_start + name_length:name_start + name_length + extra_length]
             compressed, uncompressed, local_offset = self._zip64_values(extra, compressed, uncompressed, local_offset)
             self.entries[name.casefold()] = (name, method, compressed, uncompressed, local_offset)
@@ -741,15 +748,28 @@ class CentralDirectoryZip:
         entry = self.entries.get(key)
         if not entry: return None
         _name, method, compressed, uncompressed, local = entry
-        if self.data[local:local + 4] not in (b"PK\x03\x04", b"AEM!"):
-            raise ValueError("invalid_local_header")
+        # Some protected mods replace even the local-header signature.  The
+        # central directory remains the authority; only the two length fields
+        # below are needed to locate the payload.
+        if local < 0 or local + 30 > len(self.data): raise ValueError("invalid_local_header")
         name_length, extra_length = self._u16(local + 26), self._u16(local + 28)
         payload = self.data[local + 30 + name_length + extra_length:local + 30 + name_length + extra_length + compressed]
         if len(payload) != compressed: raise ValueError("truncated_archive_entry")
         if method == 0: output = payload
-        elif method == 8: output = zlib.decompress(payload, -zlib.MAX_WBITS)
+        elif method == 8:
+            # A few SCS protectors retain valid DEFLATE bytes but lie about
+            # the declared unpacked length.  Accept a complete stream that
+            # produced at least the central-directory size, with a strict
+            # bounded recovery margin copied from Universal SCS Extractor.
+            margin = min(max(uncompressed // 100, 64 * 1024), 16 * 1024 * 1024)
+            limit = min(64 * 1024 * 1024, uncompressed + margin)
+            inflater = zlib.decompressobj(-zlib.MAX_WBITS)
+            output = inflater.decompress(payload, limit + 1)
+            if len(output) > limit or inflater.unconsumed_tail: raise ValueError("deflate_output_limit")
+            output += inflater.flush()
+            if len(output) > limit or len(output) < uncompressed: raise ValueError("invalid_archive_entry_size")
         else: raise ValueError("unsupported_zip_compression")
-        if len(output) != uncompressed: raise ValueError("invalid_archive_entry_size")
+        if method == 0 and len(output) != uncompressed: raise ValueError("invalid_archive_entry_size")
         return output
 
 MASK64 = (1 << 64) - 1
@@ -805,32 +825,88 @@ class HashFsArchive:
         if self.version == 1: self._v1()
         elif self.version == 2: self._v2()
         else: raise ValueError("unsupported_hashfs_version")
+    def close(self):
+        self.data.close(); self._file.close()
     def _v1(self):
         count, table = struct.unpack_from("<II", self.data, 12)
         for index in range(count):
             value = struct.unpack_from("<QQIIII", self.data, table + index * 32)
-            self.entries[value[0]] = (value[1], value[5], value[4], 0x10 if value[2] & 2 else 0)
+            self.entries[value[0]] = (value[1], value[5], value[4], 1 if value[2] & 2 else 0)
     def _v2(self):
         count, et_size, words, mt_size, et_off, mt_off = struct.unpack_from("<IIIIQQ", self.data, 12)
-        et = zlib.decompress(self.data[et_off:et_off + et_size]); mt = zlib.decompress(self.data[mt_off:mt_off + mt_size])
+        def table(offset, stored_size, expected_size):
+            raw = self.data[offset:offset + stored_size]
+            # The revised extractor accepts both compressed and plain HashFS
+            # v2 tables.  Some protectors deliberately keep the latter while
+            # preserving otherwise valid metadata.
+            try:
+                value = zlib.decompress(raw)
+                if len(value) == expected_size: return value
+            except zlib.error:
+                pass
+            if len(raw) == expected_size: return raw
+            raise ValueError("invalid_hashfs_table")
+        et = table(et_off, et_size, count * 16); mt = table(mt_off, mt_size, words * 4)
         if len(et) != count * 16 or len(mt) != words * 4: raise ValueError("invalid_hashfs_index")
+        # A v2 row can point to several metadata chunks.  In particular,
+        # protected archives often put a decoy chunk first and the real file
+        # descriptor later.  The chunk's three-byte body address is explicit;
+        # do not assume the first descriptor is the payload header.
         for index in range(count):
-            hashed, meta_index, parts, flags = struct.unpack_from("<QIHH", et, index * 16)
+            hashed, meta_index, parts, _flags = struct.unpack_from("<QIHH", et, index * 16)
+            if not parts or (meta_index + parts) * 4 > len(mt): continue
+            descriptors = []
             for part in range(parts):
-                at = (meta_index + part) * 4; low, high, kind = struct.unpack_from("<HBB", mt, at); head = (low | high << 16) * 4
-                if kind & 0x80:
-                    zs_low, zs_high, flags2, us_low, us_high, _flags3, _unknown, block = struct.unpack_from("<HBBHBBII", mt, head)
-                    self.entries[hashed] = (block * 16, zs_low | zs_high << 16, us_low | us_high << 16, flags2 & 0xf0)
-                    break
+                at = (meta_index + part) * 4
+                body_index = mt[at] | mt[at + 1] << 8 | mt[at + 2] << 16
+                descriptors.append((body_index, mt[at + 3]))
+            primary = next(((body_index, kind) for body_index, kind in descriptors
+                            if kind in (128, 129, 1)), None)
+            if primary is None: continue
+            body_index, kind = primary; body = body_index * 4
+            # Type 1 is a packed texture and has an additional 12-byte image
+            # descriptor.  It cannot be a manifest, but skipping it keeps the
+            # index valid for archive-wide icon discovery.
+            if kind == 1: body += 12
+            if body + 16 > len(mt): continue
+            packed_field, size_field, _unknown, block = struct.unpack_from("<IIII", mt, body)
+            packed, size = packed_field & 0x0fffffff, size_field & 0x0fffffff
+            if kind == 1: size = packed
+            compression_bits = (packed_field >> 28) & 15
+            stored = packed if compression_bits else size
+            offset = block * 16
+            if not stored or offset + stored > len(self.data): continue
+            # 1 = zlib, 2 = raw DEFLATE.  Other non-zero flags are still zlib
+            # in current HashFS packages and are handled by the standard path.
+            compression = 2 if kind in (128, 129) and compression_bits == 2 else (1 if compression_bits else 0)
+            self.entries.setdefault(hashed, (offset, stored, size, compression))
     def read(self, requested):
         path = str(requested).replace("\\", "/").lstrip("/")
         # HashFS v1 prepends the *decimal* salt to a path before CityHash.
         # Keep v2 unchanged: its salt handling is not compatible with v1.
-        hashed_path = f"{self.salt}{path}" if self.version == 1 and self.salt else path
-        entry = self.entries.get(cityhash64(hashed_path.encode("utf-8")))
+        hashed_path = f"{self.salt}{path}" if self.salt else path
+        # Both HashFS versions use the decimal header salt before the plain
+        # path.  Some protected v2 mods additionally contain an unsalted
+        # decoy with the same name, so the salted key must be tried first.
+        # Retain an unsalted fallback for older third-party v2 writers.
+        candidates = [hashed_path, path] if self.salt else [path]
+        entry = next((self.entries.get(cityhash64(candidate.encode("utf-8")))
+                      for candidate in candidates if self.entries.get(cityhash64(candidate.encode("utf-8")))), None)
+        if not entry and self.version == 1 and path.casefold() == "manifest.sii":
+            # A handful of packed mods erase the v1 salt from the header but
+            # keep it in the CityHash input.  Manifest is small and unique,
+            # so the extractor's bounded 16-bit recovery is safe here and is
+            # attempted only after the normal constant-time lookup failed.
+            original = self.salt
+            for candidate in range(65536):
+                found = self.entries.get(cityhash64(f"{candidate}{path}".encode("utf-8")))
+                if found:
+                    self.salt, entry = candidate, found
+                    break
+            if not entry: self.salt = original
         if not entry: return None
         offset, packed, size, compression = entry; raw = self.data[offset:offset + packed]
-        value = raw if compression == 0 else zlib.decompress(raw) if compression == 0x10 else None
+        value = raw if compression == 0 else zlib.decompress(raw, -zlib.MAX_WBITS if compression == 2 else zlib.MAX_WBITS)
         if value is None or len(value) != size: return None
         return value
 
@@ -838,10 +914,22 @@ def archive_entry(path, requested):
     """Return an entry from native SCS HashFS or SCS-compatible ZIP."""
     try:
         if Path(path).is_dir():
-            entry = Path(path) / Path(str(requested).replace("\\", "/").lstrip("/"))
+            root = Path(path); parts = [part for part in str(requested).replace("\\", "/").split("/") if part and part not in (".", "..")]
+            entry = root.joinpath(*parts)
+            if not entry.is_file():
+                # Workshop packages on Linux can use a different case than a
+                # profile/manifest reference. ZIP and HashFS are looked up
+                # case-insensitively, so directory packages must behave the
+                # same way.
+                entry = root
+                for part in parts:
+                    try: entry = next(child for child in entry.iterdir() if child.name.casefold() == part.casefold())
+                    except (OSError, StopIteration): return None
             return entry.read_bytes() if entry.is_file() else None
         with open(path, "rb") as source: raw = source.read(3)
-        return HashFsArchive(path).read(requested) if raw == b"SCS" else CentralDirectoryZip(path).read(requested)
+        archive = HashFsArchive(path) if raw == b"SCS" else CentralDirectoryZip(path)
+        try: return archive.read(requested)
+        finally: archive.close()
     except (OSError, ValueError, struct.error, zlib.error):
         return None
 
@@ -891,8 +979,16 @@ def description_text(data):
         except UnicodeDecodeError: continue
     return data.decode("latin-1", errors="replace").replace("\x00", "").strip()
 
+def first_archive_entry(path, candidates):
+    """Read the first present package file, preserving archive case rules."""
+    for candidate in candidates:
+        if not candidate: continue
+        value = archive_entry(path, candidate)
+        if value: return value, str(candidate)
+    return None, ""
+
 def manifest_metadata(path):
-    manifest = archive_entry(path, "manifest.sii")
+    manifest, _manifest_name = first_archive_entry(path, ("manifest.sii", "/manifest.sii"))
     if not manifest: return {}
     try: content = decode_sii(manifest)
     except (ValueError, UnicodeDecodeError, zlib.error): content = manifest.decode("utf-8", errors="replace")
@@ -902,14 +998,20 @@ def manifest_metadata(path):
     optional = sii_values(content, "mp_mod_optional")
     icon_name = (sii_values(content, "icon") or [""])[0]
     description_name = (sii_values(content, "description_file") or [""])[0]
-    icon = image_data_uri(archive_entry(path, icon_name), icon_name) if icon_name else ""
+    # ``icon`` is optional.  Many established mods simply put icon.jpg/png
+    # alongside manifest.sii, which the updated extractor also recognizes.
+    # Keep the explicit manifest path first and then probe only conventional
+    # root names so arbitrary artwork is never mistaken for an icon.
+    icon_data, resolved_icon = first_archive_entry(path, [icon_name, "icon.jpg", "icon.jpeg", "icon.png", "icon.webp", "icon.gif", "icon.bmp"])
+    description_data, _description = first_archive_entry(path, [description_name, "description.txt", "description.en.txt", "description.ru.txt"])
+    icon = image_data_uri(icon_data, resolved_icon or icon_name) if icon_data else ""
     return {
         "name": name[0] if name else "", "version": version[0] if version else "",
         "author": author[0] if author else "", "convoy": optional[0].casefold() == "true" if optional else None,
         "dlc": sii_values(content, "dlc_dependencies"),
         "compatible_versions": sii_values(content, "compatible_versions"),
         "categories": sii_values(content, "category"), "icon": icon,
-        "description": description_text(archive_entry(path, description_name)) if description_name else "",
+        "description": description_text(description_data) if description_data else "",
     }
 
 def cached_icon_available(value):
@@ -990,6 +1092,237 @@ def mod_folder_names(root):
         return sorted((item.name for item in folder.iterdir()
                        if item.is_dir() or (item.is_file() and item.suffix.casefold() in (".scs", ".zip"))), key=str.casefold)
     except OSError: return []
+
+WORKSHOP_GAME_IDS = {"ets2": "227300", "ats": "270880"}
+
+def workshop_game_ids(game_root):
+    """Choose Workshop content for the currently opened SCS profile folder."""
+    name = Path(game_root).expanduser().name.casefold()
+    if "american truck" in name or name == "ats": return (WORKSHOP_GAME_IDS["ats"],)
+    if "euro truck" in name or name == "ets2": return (WORKSHOP_GAME_IDS["ets2"],)
+    # Never mix both games into an unknown profile folder: ETS2 and ATS may
+    # have unrelated Workshop packages with identical archive names. A custom
+    # folder can still be named ETS2 or ATS to opt in explicitly.
+    return ()
+
+def steam_library_candidates():
+    """Return likely Steam library roots without recursively scanning disks."""
+    raw = os.environ.get("SCS_STEAM_LIBRARY_PATHS", "")
+    candidates = [Path(item.strip()).expanduser() for item in raw.split(os.pathsep) if item.strip()]
+    if candidates:
+        return candidates
+    for variable in ("STEAM_PATH", "STEAM_INSTALL_PATH"):
+        if os.environ.get(variable): candidates.append(Path(os.environ[variable]).expanduser())
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Valve\\Steam") as key:
+            value, _kind = winreg.QueryValueEx(key, "SteamPath")
+            if value: candidates.append(Path(str(value)))
+    except (ImportError, OSError, ValueError):
+        pass
+    candidates.extend((Path(os.environ.get("ProgramFiles(x86)", r"C:\\Program Files (x86)")) / "Steam", Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "Steam"))
+    # This is intentionally a short list of well-known roots per drive, not a
+    # full disk crawl. It finds independent libraries such as A:\SteamLibrary.
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        drive = Path(letter + ":\\")
+        if not drive.is_dir(): continue
+        candidates.extend((drive / "Steam", drive / "SteamLibrary", drive / "SteamLibrary1", drive / "Games" / "Steam"))
+    seen, result = set(), []
+    for candidate in candidates:
+        try: key = str(candidate.resolve()).casefold()
+        except OSError: key = str(candidate).casefold()
+        if key not in seen:
+            seen.add(key); result.append(candidate)
+    return result
+
+def steam_library_roots():
+    """Read Steam's configured libraries, then return existing library roots."""
+    candidates = steam_library_candidates()
+    for steam_root in list(candidates):
+        vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+        try:
+            content = vdf.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        for value in re.findall(r'"path"\s+"([^"]+)"', content, re.I):
+            candidates.append(Path(value.replace("\\\\", "\\")))
+    seen, result = set(), []
+    for candidate in candidates:
+        library = candidate
+        # A user can provide either the Steam root or the steamapps directory.
+        if library.name.casefold() == "steamapps": library = library.parent
+        if not (library / "steamapps").is_dir(): continue
+        try: key = str(library.resolve()).casefold()
+        except OSError: key = str(library).casefold()
+        if key not in seen:
+            seen.add(key); result.append(library)
+    return result
+
+def sii_without_comments(content):
+    """Remove SII comments without damaging # or // inside quoted values."""
+    output = []
+    for line in str(content or "").splitlines():
+        quoted = escaped = False; index = 0
+        while index < len(line):
+            character = line[index]
+            if quoted:
+                if escaped: escaped = False
+                elif character == "\\": escaped = True
+                elif character == '"': quoted = False
+            elif character == '"': quoted = True
+            elif character == '#' or line[index:index + 2] == '//':
+                line = line[:index]; break
+            index += 1
+        output.append(line)
+    return "\n".join(output)
+
+def workshop_version_infos(workshop_dir):
+    """Parse package_version_info blocks from a Workshop versions.sii."""
+    try: content = (Path(workshop_dir) / "versions.sii").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError: return []
+    content = sii_without_comments(content); result = []
+    for match in re.finditer(r'package_version_info\s*:\s*([^\s{]+)\s*\{(.*?)\}', content, re.I | re.S):
+        body = match.group(2); names = sii_values(body, "package_name")
+        if not names: continue
+        informational = (sii_values(body, "informational") or [""])[0].casefold() == "true"
+        result.append({"unit": match.group(1), "package_name": names[0],
+                       "compatible_versions": sii_values(body, "compatible_versions"),
+                       "informational": informational})
+    return result
+
+def workshop_version_matches(game_version, pattern):
+    """Match versions.sii wildcards against the version reported by game.log."""
+    version, pattern = str(game_version or "").strip(), str(pattern or "").strip()
+    if not version or not pattern: return False
+    expression = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return bool(re.match(expression, version, re.I))
+
+def workshop_package_path(workshop_dir, package_name):
+    """Resolve package_name exactly as Steam/SCS does for a Workshop item."""
+    root = Path(workshop_dir); name = str(package_name or "").strip().replace("\\", "/").lstrip("/")
+    if not name or ".." in Path(name).parts: return None
+    direct = root.joinpath(*name.split("/")); candidates = [direct]
+    if not direct.suffix: candidates.extend((direct.with_suffix(".scs"), direct.with_suffix(".zip")))
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+def selected_workshop_packages(workshop_dir, game_version):
+    """Return the content selected by versions.sii and its metadata package."""
+    infos = workshop_version_infos(workshop_dir)
+    if not infos: return []
+    content = [item for item in infos if not item["informational"]]
+    matching = [item for item in content if any(workshop_version_matches(game_version, value)
+                                                for value in item["compatible_versions"])]
+    defaults = [item for item in content if not item["compatible_versions"]]
+    selected = matching[-1:] or defaults[:1] or content[-1:]
+    information = next((path for item in infos if item["informational"]
+                        for path in [workshop_package_path(workshop_dir, item["package_name"])]
+                        if path is not None), None)
+    result = []
+    for item in selected:
+        source = workshop_package_path(workshop_dir, item["package_name"])
+        if source is not None: result.append((source, information or source))
+    return result
+
+def workshop_mod_sources(game_root, game_version=None):
+    """Discover the Workshop package selected by each item's versions.sii."""
+    if game_version is None: game_version = game_log_info(game_root).get("game_version", "")
+    game_ids = workshop_game_ids(game_root); records = []
+    for library in steam_library_roots():
+        steamapps = library / "steamapps"
+        for game_id in game_ids:
+            if not (steamapps / ("appmanifest_" + game_id + ".acf")).is_file(): continue
+            content = steamapps / "workshop" / "content" / game_id
+            if not content.is_dir(): continue
+            try: workshop_dirs = sorted((item for item in content.iterdir() if item.is_dir() and item.name.isdigit()), key=lambda item: int(item.name))
+            except OSError: continue
+            for workshop_dir in workshop_dirs:
+                selected = selected_workshop_packages(workshop_dir, game_version)
+                if selected:
+                    for path, metadata_path in selected:
+                        try: relative = path.relative_to(workshop_dir).as_posix()
+                        except ValueError: relative = path.name
+                        records.append({"file": f"workshop:{workshop_dir.name}/{relative}",
+                                        "path": path, "metadata_path": metadata_path,
+                                        "workshop_id": workshop_dir.name, "source": "workshop"})
+                    continue
+                try: files = sorted((item for item in workshop_dir.rglob("*") if item.is_file() and item.suffix.casefold() in (".scs", ".zip")), key=lambda item: str(item).casefold())
+                except OSError: continue
+                for path in files:
+                    try: relative = path.relative_to(workshop_dir).as_posix()
+                    except ValueError: relative = path.name
+                    records.append({"file": f"workshop:{workshop_dir.name}/{relative}", "path": path, "metadata_path": path, "workshop_id": workshop_dir.name, "source": "workshop"})
+                if files:
+                    continue
+                # Steam commonly expands an item directly into its Workshop
+                # directory instead of supplying a .scs archive.  The ETS2
+                # item 3102978967, for example, keeps its package in
+                # ``universal/manifest.sii``.  Use the directory containing
+                # the manifest as the package root so archive_entry() works
+                # for manifest, icon and description reads alike.
+                roots = [workshop_dir, workshop_dir / "universal"]
+                try:
+                    roots.extend(path.parent for path in workshop_dir.rglob("manifest.sii"))
+                except OSError:
+                    pass
+                seen_roots = set()
+                for root in roots:
+                    if not (root / "manifest.sii").is_file(): continue
+                    try: relative = root.relative_to(workshop_dir).as_posix()
+                    except ValueError: relative = root.name
+                    if relative in seen_roots: continue
+                    seen_roots.add(relative)
+                    label = relative if relative and relative != "." else "package"
+                    records.append({"file": f"workshop:{workshop_dir.name}/{label}", "path": root, "metadata_path": root, "workshop_id": workshop_dir.name, "source": "workshop"})
+    # Duplicate library paths can occur when Steam itself is a library.
+    unique = {}
+    for record in records: unique.setdefault(str(record["path"]).casefold(), record)
+    return sorted(unique.values(), key=lambda item: item["file"].casefold())
+
+def workshop_package_id(value):
+    """Convert profile's mod_workshop_package.<hex> to a Steam item ID."""
+    match = re.fullmatch(r"mod_workshop_package\.([0-9a-f]+)", str(value or ""), re.I)
+    if not match: return ""
+    try: return str(int(match.group(1), 16))
+    except ValueError: return ""
+
+def metadata_for_source_records(records, retry_icons=False, verify_cache=False):
+    """Manifest cache variant for files outside Documents/<game>/mod."""
+    raw_cache = load_resource_json("mod_manifest_cache.json", {})
+    cache = raw_cache if isinstance(raw_cache, dict) else {}
+    result, pending, next_cache, changed = {}, [], dict(cache), False
+    for record in records:
+        path, display = Path(record.get("metadata_path", record["path"])), str(record["file"])
+        try: stat = path.stat(); fingerprint = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError: continue
+        key = str(path.resolve()).casefold(); old = cache.get(key); metadata = old.get("metadata") if isinstance(old, dict) else None
+        missing_icon = isinstance(metadata, dict) and bool(metadata.get("icon")) and not cached_icon_available(metadata.get("icon"))
+        retry = retry_icons and isinstance(metadata, dict) and not metadata.get("icon")
+        if isinstance(old, dict) and old.get("fingerprint") == fingerprint and isinstance(metadata, dict) and metadata and not missing_icon and not retry and not verify_cache:
+            result[mod_match_key(display)] = metadata
+        else: pending.append((display, path, key, fingerprint))
+    with ThreadPoolExecutor(max_workers=min(16, max(6, (os.cpu_count() or 4) * 2))) as pool:
+        futures = {pool.submit(manifest_metadata, path): (display, key, fingerprint) for display, path, key, fingerprint in pending}
+        for future in as_completed(futures):
+            display, key, fingerprint = futures[future]
+            try: metadata = future.result()
+            except Exception: metadata = {}
+            result[mod_match_key(display)] = metadata
+            replacement = {"fingerprint": fingerprint, "metadata": metadata}
+            if next_cache.get(key) != replacement: next_cache[key] = replacement; changed = True
+    if changed: save_resource_json("mod_manifest_cache.json", next_cache)
+    return result
+
+def cached_metadata_for_source_records(records):
+    raw_cache = load_resource_json("mod_manifest_cache.json", {})
+    cache = raw_cache if isinstance(raw_cache, dict) else {}; result = {}
+    for record in records:
+        path, display = Path(record.get("metadata_path", record["path"])), str(record["file"])
+        try: stat = path.stat(); fingerprint = f"{stat.st_size}:{stat.st_mtime_ns}"
+        except OSError: continue
+        cached = cache.get(str(path.resolve()).casefold()); metadata = cached.get("metadata") if isinstance(cached, dict) else None
+        if isinstance(metadata, dict) and metadata and cached.get("fingerprint") == fingerprint and (not metadata.get("icon") or cached_icon_available(metadata.get("icon"))):
+            result[mod_match_key(display)] = metadata
+    return result
 
 ARCHIVE_SUFFIXES = {".scs", ".zip", ".7z", ".rar"}
 
@@ -1156,7 +1489,24 @@ def manager_mods(game_path, directory):
     # Reuse cache immediately. Only unknown or changed archives are then
     # requested by the browser in batches.
     metadata = cached_mod_metadata(folder, folder_names)
+    game_state = game_log_info(root)
+    workshop_records = workshop_mod_sources(root, game_state.get("game_version", ""))
+    workshop_metadata = cached_metadata_for_source_records(workshop_records)
     entries = manager_mod_entries(root, text, metadata)
+    # Workshop profile values are hexadecimal Steam published-file IDs, while
+    # the downloaded archive has an arbitrary filename. Join them by the
+    # Workshop directory ID and retain the original SII value for saving.
+    by_workshop_id = {}
+    for record in workshop_records: by_workshop_id.setdefault(record["workshop_id"], record)
+    raw_values = {int(match.group(1)): match.group(2) for match in re.finditer(r'^\s*active_mods\[(\d+)\]\s*:\s*"(.*)"\s*$', text, re.MULTILINE)}
+    for entry in entries:
+        raw = raw_values.get(entry.get("index"), entry.get("sii_value", "")); raw_file = raw.split("|", 1)[0]
+        record = by_workshop_id.get(workshop_package_id(raw_file))
+        if not record: continue
+        info = workshop_metadata.get(mod_match_key(record["file"]), {})
+        entry.update({"file": record["file"], "sii_value": raw, "workshop_id": record["workshop_id"], "source": "workshop"})
+        entry.update({key: info.get(key, entry.get(key, [] if key in ("dlc", "compatible_versions", "categories") else "")) for key in ("version", "author", "convoy", "dlc", "compatible_versions", "categories", "icon")})
+        if info.get("name"): entry["name"] = info["name"]
     # profile.sii is the authoritative source for the in-game title of an
     # active mod.  Reuse it in the general mod library immediately, before
     # background manifest loading begins.
@@ -1179,20 +1529,37 @@ def manager_mods(game_path, directory):
         "manifest_found": bool(metadata.get(mod_match_key(name), {})),
         **details.get(mod_match_key(name), {"created": 0, "size": 0}),
     } for name in folder_names]
-    return {"active_mods": int(count.group(1)) if count else 0, "mods": entries, "folder_mods": folder_mods, **game_log_info(root)}, None
+    for record in workshop_records:
+        info = workshop_metadata.get(mod_match_key(record["file"]), {})
+        try: stat = Path(record["path"]).stat(); details = {"created": stat.st_ctime, "size": stat.st_size}
+        except OSError: details = {"created": 0, "size": 0}
+        folder_mods.append({
+            "file": record["file"], "name": info.get("name") or Path(record["path"]).stem,
+            "version": info.get("version", ""), "author": info.get("author", ""), "convoy": info.get("convoy"),
+            "dlc": info.get("dlc", []), "compatible_versions": info.get("compatible_versions", []),
+            "categories": info.get("categories", []), "icon": info.get("icon", ""), "description": info.get("description", ""),
+            "metadata_loaded": mod_match_key(record["file"]) in workshop_metadata, "manifest_found": bool(info),
+            "workshop_id": record["workshop_id"], "source": "workshop", **details,
+        })
+    return {"active_mods": int(count.group(1)) if count else 0, "mods": entries, "folder_mods": folder_mods, **game_state}, None
 
 def load_mod_metadata(game_path, requested_names, retry_icons=False, verify_cache=False):
     root = Path(game_path).expanduser(); folder = root / "mod"
-    if not folder.is_dir(): return [], None
     available = {mod_match_key(item.name): item.name for item in folder.iterdir()
-                 if item.is_dir() or (item.is_file() and item.suffix.casefold() in (".scs", ".zip"))}
-    names = []
+                 if item.is_dir() or (item.is_file() and item.suffix.casefold() in (".scs", ".zip"))} if folder.is_dir() else {}
+    names, workshop_names = [], []
+    workshop_available = {mod_match_key(item["file"]): item for item in workshop_mod_sources(root)}
     for value in requested_names if isinstance(requested_names, list) else []:
         if not isinstance(value, str): continue
         name = available.get(mod_match_key(Path(value).name))
-        if name: names.append(name)
+        if name: names.append(name); continue
+        record = workshop_available.get(mod_match_key(value))
+        if record: workshop_names.append(record)
     metadata = mod_metadata_cache(folder, names, bool(retry_icons), bool(verify_cache))
-    return [{"file": name, "metadata_loaded": True, "manifest_found": bool(metadata.get(mod_match_key(name), {})), **metadata.get(mod_match_key(name), {})} for name in names], None
+    workshop_metadata = metadata_for_source_records(workshop_names, bool(retry_icons), bool(verify_cache))
+    local = [{"file": name, "metadata_loaded": True, "manifest_found": bool(metadata.get(mod_match_key(name), {})), **metadata.get(mod_match_key(name), {})} for name in names]
+    remote = [{"file": item["file"], "metadata_loaded": True, "manifest_found": bool(workshop_metadata.get(mod_match_key(item["file"]), {})), "workshop_id": item["workshop_id"], "source": "workshop", **workshop_metadata.get(mod_match_key(item["file"]), {})} for item in workshop_names]
+    return local + remote, None
 
 def sii_escape_string(value):
     """Encode text safely for a quoted plain-SII value.
@@ -1262,7 +1629,7 @@ def save_mod_groups(value):
     save_resource_json("mod_groups.json", {"groups": groups})
     return {"groups": groups}, None
 
-VIEW_FILTER_KEYS = ("author", "version", "compatible", "dlc", "status")
+VIEW_FILTER_KEYS = ("author", "version", "compatible", "dlc", "status", "source")
 VIEW_SORTS = {"created_desc", "created_asc", "name_asc", "name_desc", "size_desc", "size_asc", "categories_asc", "categories_desc"}
 
 def clean_view_filters(value):

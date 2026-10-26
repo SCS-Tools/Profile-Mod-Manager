@@ -3,7 +3,7 @@
   "name": "Profile Mod Manager",
   "desc_ru": "Визуальный менеджер модификаций профиля ETS2: порядок загрузки, фильтры, группы, пресеты, резервные копии и HTML-экспорт.",
   "desc_en": "A visual ETS2 profile mod manager with load-order editing, filters, groups, presets, backups and HTML export.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "icon": "icon.png",
   "banner": "banner.png",
   "runtime": {
